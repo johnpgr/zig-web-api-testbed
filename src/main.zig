@@ -38,7 +38,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     // 5. Send Startup Message / Perform Handshake
     std.debug.print("Sending StartupMessage...\n", .{});
-    try conn.startup(alloc, "joao", "postgres");
+    try conn.startup(alloc, .{
+        .user = "joao",
+        .database = "postgres",
+    });
     std.debug.print("Authentication and Handshake Successful!\n", .{});
 
     // 6. Execute Query

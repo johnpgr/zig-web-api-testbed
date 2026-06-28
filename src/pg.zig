@@ -1,9 +1,11 @@
 const std = @import("std");
 const posix = std.posix;
+const casts = @import("casts.zig");
 const Io = std.Io;
 const proto = @import("pg/proto.zig");
 const InMessage = proto.InMessage;
 const OutMessage = proto.OutMessage;
+const tousize = casts.tousize;
 
 pub const Column = struct {
     name: []const u8,
@@ -23,6 +25,50 @@ pub const Row = struct {
         return try std.fmt.parseInt(T, str, 10);
     }
 };
+
+pub const StartupOptions = struct {
+    user: []const u8,
+    database: []const u8,
+    password: ?[]const u8 = null,
+};
+
+fn bytesToHex(bytes: []const u8, out_hex: []u8) !void {
+    var i: usize = 0;
+    for (bytes) |b| {
+        _ = try std.fmt.bufPrint(out_hex[i..][0..2], "{x:0>2}", .{b});
+        i += 2;
+    }
+}
+
+fn computeMd5Password(
+    allocator: std.mem.Allocator,
+    username: []const u8,
+    password: []const u8,
+    salt: []const u8,
+) ![]const u8 {
+    const Md5 = std.crypto.hash.Md5;
+
+    const concat1 = try std.fmt.allocPrint(allocator, "{s}{s}", .{ password, username });
+    defer allocator.free(concat1);
+
+    var hash1: [Md5.digest_length]u8 = undefined;
+    Md5.hash(concat1, &hash1, .{});
+
+    var hex1: [Md5.digest_length * 2]u8 = undefined;
+    try bytesToHex(&hash1, &hex1);
+
+    var concat2: [36]u8 = undefined;
+    @memcpy(concat2[0..32], &hex1);
+    @memcpy(concat2[32..36], salt);
+
+    var hash2: [Md5.digest_length]u8 = undefined;
+    Md5.hash(&concat2, &hash2, .{});
+
+    var hex2: [Md5.digest_length * 2]u8 = undefined;
+    try bytesToHex(&hash2, &hex2);
+
+    return try std.fmt.allocPrint(allocator, "md5{s}", .{hex2});
+}
 
 pub const QueryResult = struct {
     conn: *PgConnection,
@@ -80,7 +126,7 @@ pub const QueryResult = struct {
                 var temp_msg = InMessage.init('T', original_data);
                 temp_msg.pos = msg.pos;
 
-                const limit = @as(usize, @intCast(num_fields));
+                const limit = tousize(num_fields);
                 var i: usize = 0;
                 while (i < limit) : (i += 1) {
                     const name = try temp_msg.readString();
@@ -138,7 +184,7 @@ pub const QueryResult = struct {
                     const fields = try self.allocator.alloc(?[]const u8, @intCast(num_vals));
                     errdefer self.allocator.free(fields);
 
-                    const limit = @as(usize, @intCast(num_vals));
+                    const limit = tousize(num_vals);
                     var i: usize = 0;
                     while (i < limit) : (i += 1) {
                         const val_len = try msg.readInt32();
@@ -194,7 +240,7 @@ pub const PgConnection = struct {
         const tag = try self.pg_reader.interface.takeByte();
         const length = try self.pg_reader.interface.takeInt(i32, .big);
         if (length < 4) return error.InvalidMessageLength;
-        const payload_len = @as(usize, @intCast(length - 4));
+        const payload_len = tousize(length - 4);
 
         const payload = try allocator.alloc(u8, payload_len);
         errdefer allocator.free(payload);
@@ -222,20 +268,34 @@ pub const PgConnection = struct {
         return error.PostgresError;
     }
 
+    fn sendPassword(self: *PgConnection, allocator: std.mem.Allocator, password: []const u8) !void {
+        const msg_len = 1 + 4 + password.len + 1;
+        const buf = try allocator.alloc(u8, msg_len);
+        defer allocator.free(buf);
+
+        var out = OutMessage.begin(buf, 'p');
+        out.writeString(password);
+        const msg_slice = try out.build();
+
+        var write_buf: [256]u8 = undefined;
+        var pg_writer = self.file.writerStreaming(self.io, &write_buf);
+        try pg_writer.interface.writeAll(msg_slice);
+        try pg_writer.interface.flush();
+    }
+
     pub fn startup(
         self: *PgConnection,
         allocator: std.mem.Allocator,
-        user: []const u8,
-        database: []const u8,
+        options: StartupOptions,
     ) !void {
         var send_buf: [512]u8 = undefined;
         var out = OutMessage.beginStartup(&send_buf);
 
         out.writeInt32(196608); // Protocol version 3.0
         out.writeString("user");
-        out.writeString(user);
+        out.writeString(options.user);
         out.writeString("database");
-        out.writeString(database);
+        out.writeString(options.database);
         out.writeByte(0);
 
         const msg_slice = try out.build();
@@ -252,8 +312,19 @@ pub const PgConnection = struct {
             switch (msg.tag) {
                 'R' => {
                     const auth_type = try msg.readInt32();
-                    if (auth_type != 0) {
-                        return error.AuthenticationFailed;
+                    if (auth_type == 0) {
+                        // Success
+                    } else if (auth_type == 3) {
+                        const pwd = options.password orelse return error.PasswordRequired;
+                        try self.sendPassword(allocator, pwd);
+                    } else if (auth_type == 5) {
+                        const salt = try msg.readBytes(4);
+                        const pwd = options.password orelse return error.PasswordRequired;
+                        const hashed_pwd = try computeMd5Password(allocator, options.user, pwd, salt);
+                        defer allocator.free(hashed_pwd);
+                        try self.sendPassword(allocator, hashed_pwd);
+                    } else {
+                        return error.UnsupportedAuthenticationMethod;
                     }
                 },
                 'S' => {
