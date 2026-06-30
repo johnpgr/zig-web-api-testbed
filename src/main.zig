@@ -1,12 +1,13 @@
 const std = @import("std");
+const core = @import("core.zig");
 const consts = @import("consts.zig");
-const casts = @import("casts.zig");
-const VirtualArena = @import("VirtualArena.zig");
-const Scratch = @import("ScratchArena.zig");
 const pg = @import("pg.zig");
+const Config = @import("config.zig");
+const server = @import("server.zig");
 
 const Io = std.Io;
 const GiB = consts.GiB;
+const VirtualArena = core.VirtualArena;
 
 pub fn main(init: std.process.Init.Minimal) !void {
     var arena = try VirtualArena.init(1 * GiB);
@@ -21,40 +22,21 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     const io = evented.io();
     const main_alloc = arena.allocator();
+    const config = Config.init(init.environ);
 
-    const socket_path = "/home/joao/dev/zig-web-api-testbed/postgres_socket/.s.PGSQL.5433";
+    var socket_path_buf: [256]u8 = undefined;
+    const socket_path = try config.pgSocketPath(&socket_path_buf);
+
+    std.debug.print("Connecting to PostgreSQL at socket: {s}...\n", .{socket_path});
     const conn = try pg.connect(io, main_alloc, socket_path);
     defer conn.close(io, main_alloc);
 
-    std.debug.print("Connected to PostgreSQL socket!\n", .{});
-
-    var scratch = Scratch.begin(&arena);
-    defer scratch.end();
-    const alloc = scratch.allocator();
-
-    std.debug.print("Sending StartupMessage...\n", .{});
-    try conn.startup(alloc, .{
-        .user = "joao",
-        .database = "postgres",
+    std.debug.print("Sending PostgreSQL StartupMessage (user: {s}, database: {s})...\n", .{ config.pg_user, config.pg_database });
+    try conn.startup(main_alloc, .{
+        .user = config.pg_user,
+        .database = config.pg_database,
     });
-    std.debug.print("Authentication and Handshake Successful!\n", .{});
+    std.debug.print("PostgreSQL Handshake Successful!\n", .{});
 
-    std.debug.print("Executing query...\n", .{});
-    var result = try conn.query(alloc, "SELECT 42 as number, 'Antigravity' as name, NULL as val;");
-    defer result.deinit();
-
-    std.debug.print("Columns:\n", .{});
-    for (result.columns) |col| {
-        std.debug.print("  - {s} (OID: {})\n", .{col.name, col.type_oid});
-    }
-
-    std.debug.print("Rows:\n", .{});
-    while (try result.next()) |row| {
-        const num = try row.getInt(0, i32);
-        const name = row.get(1) orelse "NULL";
-        const val = row.get(2) orelse "NULL";
-        std.debug.print("  - num: {}, name: {s}, val: {s}\n", .{num, name, val});
-    }
-
-    std.debug.print("Done!\n", .{});
+    try server.run(io, &arena, config, conn);
 }

@@ -1,11 +1,12 @@
 const std = @import("std");
-const posix = std.posix;
-const casts = @import("casts.zig");
-const Io = std.Io;
+const core = @import("core.zig");
 const proto = @import("pg/proto.zig");
+
+const Io = std.Io;
 const InMessage = proto.InMessage;
 const OutMessage = proto.OutMessage;
-const tousize = casts.tousize;
+const posix = std.posix;
+const cast = core.cast;
 
 pub const Column = struct {
     name: []const u8,
@@ -126,7 +127,7 @@ pub const QueryResult = struct {
                 var temp_msg = InMessage.init('T', original_data);
                 temp_msg.pos = msg.pos;
 
-                const limit = tousize(num_fields);
+                const limit = cast(usize)(num_fields);
                 var i: usize = 0;
                 while (i < limit) : (i += 1) {
                     const name = try temp_msg.readString();
@@ -184,7 +185,7 @@ pub const QueryResult = struct {
                     const fields = try self.allocator.alloc(?[]const u8, @intCast(num_vals));
                     errdefer self.allocator.free(fields);
 
-                    const limit = tousize(num_vals);
+                    const limit = cast(usize)(num_vals);
                     var i: usize = 0;
                     while (i < limit) : (i += 1) {
                         const val_len = try msg.readInt32();
@@ -240,7 +241,7 @@ pub const PgConnection = struct {
         const tag = try self.pg_reader.interface.takeByte();
         const length = try self.pg_reader.interface.takeInt(i32, .big);
         if (length < 4) return error.InvalidMessageLength;
-        const payload_len = tousize(length - 4);
+        const payload_len = cast(usize)(length - 4);
 
         const payload = try allocator.alloc(u8, payload_len);
         errdefer allocator.free(payload);
